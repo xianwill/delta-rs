@@ -403,6 +403,37 @@ impl DeltaTable {
             }
         }
 
+        self.apply_logs_after_current_version().await?;
+
+        Ok(())
+    }
+
+    pub async fn update(&mut self) -> Result<(), DeltaTableError> {
+        match self.get_last_checkpoint().await {
+            Ok(last_check_point) => {
+                let should_restore = self.last_check_point.is_none() || 
+                    self.last_check_point.unwrap().version != last_check_point.version;
+
+                if should_restore {
+                    self.last_check_point = Some(last_check_point);
+                    self.restore_checkpoint(last_check_point).await?;
+                    self.version = last_check_point.version + 1;
+                }
+            }
+            Err(LoadCheckpointError::NotFound) => {
+                self.version += 1;
+            }
+            Err(e) => {
+                return Err(DeltaTableError::LoadCheckpoint { source: e });
+            }
+        }
+
+        self.apply_logs_after_current_version().await?;
+
+        Ok(())
+    }
+
+    async fn apply_logs_after_current_version(&mut self) -> Result<(), DeltaTableError> {
         // replay logs after checkpoint
         loop {
             match self.apply_log(self.version).await {
@@ -523,6 +554,10 @@ impl DeltaTable {
         }
     }
 
+    pub fn create_transaction(&mut self) -> DeltaTransaction {
+        DeltaTransaction::new(self)
+    }
+
     pub fn new(
         table_path: &str,
         storage_backend: Box<dyn StorageBackend>,
@@ -606,6 +641,115 @@ impl fmt::Display for DeltaTable {
 impl std::fmt::Debug for DeltaTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(f, "DeltaTable <{}>", self.table_path)
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum TransactionCommitError {
+    #[error("Version already exists")]
+    VersionExists,
+
+    #[error("Maximum number of retries exceeded for committing the transaction")]
+    CommitRetriesExceeded,
+
+    #[error("Commit failed: {source}")]
+    Storage { source: StorageError },
+
+    #[error("DeltaTable interaction failed: {source}")]
+    DeltaTable { source: DeltaTableError },
+}
+
+impl From<StorageError> for TransactionCommitError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::AlreadyExists => TransactionCommitError::VersionExists,
+            _ => TransactionCommitError::Storage { source: error },
+        }
+    }
+}
+
+impl From<DeltaTableError> for TransactionCommitError {
+    fn from(error: DeltaTableError) -> Self {
+        TransactionCommitError::DeltaTable { source: error }
+    }
+}
+
+pub struct DeltaTransaction<'a> {
+    delta_table: &'a mut DeltaTable,
+}
+
+impl<'a> DeltaTransaction<'a> {
+    pub fn new(delta_table: &'a mut DeltaTable) -> Self {
+        DeltaTransaction { delta_table }
+    }
+
+    // TODO: provider helpers for adding individual actions.
+    // Starting with just a `commit_all` to work out the lower-level details first.
+
+    pub async fn commit_all(&mut self, actions: &[Action]) -> Result<DeltaDataTypeVersion, TransactionCommitError> {
+        // TODO: calculate isolation level to use when checking for conflicts.
+
+        // let no_data_changed = actions.iter().all(|a| match a {
+        //     Action::add(x) => !x.dataChange,
+        //     Action::remove(x) => !x.dataChange,
+        //     _ => false,
+        // });
+        // let isolation_level = if no_data_changed {
+        //     IsolationLevel::SnapshotIsolation
+        // } else { 
+        //     IsolationLevel::Serializable
+        // };
+
+        // TODO: create a CommitInfo action and prepend it to actions.
+
+        // try to commit in a loop in case other writers write the next version first
+        let version = self.try_commit_loop(actions).await?;
+
+        self.delta_table.update().await?;
+
+        Ok(version)
+    }
+
+    async fn try_commit_loop(&mut self, actions: &[Action]) -> Result<DeltaDataTypeVersion, TransactionCommitError> {
+        let mut attempt_number = 0;
+
+        loop {
+            if attempt_number > 5 {
+                return Err(TransactionCommitError::CommitRetriesExceeded);
+            }
+
+            let commit_result = self.try_commit(actions).await;
+
+            if commit_result.is_ok() {
+                return commit_result;
+            }
+
+            attempt_number += 1;
+        }
+    }
+
+    async fn try_commit(&mut self, actions: &[Action]) -> Result<DeltaDataTypeVersion, TransactionCommitError> {
+        // Serialize all actions that are part of this log entry.
+        let jsons: Vec<String> = actions.iter()
+            .map(|a| {
+                serde_json::to_string(a).unwrap()
+            }).collect();
+        let log_entry = jsons.join("\n");
+
+        // get the next delta table version and the log path where it should be written
+        let attempt_version = self.next_attempt_version().await?;
+        let path = self.delta_table.version_to_log_path(attempt_version);
+
+        // write the log file bytes to storage
+        self.delta_table.storage.put_obj(path.as_str(), log_entry.as_bytes()).await?;
+
+        // return the newly committed version
+        Ok(attempt_version)
+    }
+
+    async fn next_attempt_version(&mut self) -> Result<DeltaDataTypeVersion, TransactionCommitError> {
+        self.delta_table.update().await?;
+        Ok(self.delta_table.version + 1)
     }
 }
 
