@@ -714,6 +714,7 @@ impl<'a> DeltaTransaction<'a> {
         let mut attempt_number = 0;
 
         loop {
+            // TODO: max attempts must be a config
             if attempt_number > 5 {
                 return Err(TransactionCommitError::CommitRetriesExceeded);
             }
